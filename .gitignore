@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# raw + generated video/data — don't commit these, they're large and not yours to redistribute
+clips/
+outputs/
+*.mp4
+*.mkv
+*.avi
+
+# auto-downloaded model weights
+*.pt
+*.onnx
