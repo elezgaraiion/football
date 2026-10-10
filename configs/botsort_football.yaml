@@ -1,0 +1,21 @@
+# BoT-SORT tuned for broadcast football, based on Ultralytics' default botsort.yaml.
+#
+# Changes from the default:
+#   new_track_thresh 0.25 -> 0.4  Only a confident detection can start a new ID. Existing tracks still
+#                                 use weak detections (down to track_low_thresh) to survive occlusions,
+#                                 which is why the detection --conf should stay low (0.1).
+#   track_buffer     30   -> 60   A lost track is kept for 60 frames (2.4 s at 25 fps) before it is
+#                                 dropped, so short absences don't create a new ID.
+
+tracker_type: botsort # (str) Tracker backend: botsort
+track_high_thresh: 0.25 # (float) First-stage association threshold
+track_low_thresh: 0.1 # (float) Second-stage threshold for low-score detections
+new_track_thresh: 0.4 # (float) Minimum score to start a new track (default 0.25)
+track_buffer: 60 # (int) Frames to keep lost tracks alive (default 30)
+match_thresh: 0.8 # (float) Association cost threshold
+fuse_score: True # (bool) Fuse detection score with IoU for matching
+gmc_method: sparseOptFlow # (str) Camera motion compensation: sparseOptFlow|orb|sift|ecc|none
+proximity_thresh: 0.5 # (float) Min IoU to consider tracks proximate for ReID
+appearance_thresh: 0.8 # (float) Min appearance similarity for ReID
+with_reid: False # (bool) Appearance ReID (teammates share kits, so it helps less in football)
+model: auto # (str) ReID model; "auto" uses detector features if available
