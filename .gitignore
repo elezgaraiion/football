@@ -12,3 +12,8 @@ outputs/
 # auto-downloaded model weights
 *.pt
 *.onnx
+
+# Ignore datasets and videos
+data/
+outputs/
+*.mp4
