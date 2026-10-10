@@ -16,7 +16,9 @@ A track A is linked to a track B when:
      in both frames. Distance is measured in body heights (box height), so it means the
      same for near and far players, and the tolerance grows with the gap.
   3. Size: the box heights at the end of A and the start of B are similar.
-  4. No ambiguity: if another, conflicting link is almost as plausible (e.g. two players
+  4. Team: when team labels are given (team_classification.py), tracks of different teams
+     (or a team player and a referee/goalkeeper) are never linked. Unknown team = compatible.
+  5. No ambiguity: if another, conflicting link is almost as plausible (e.g. two players
      close together at a set piece), neither is made. A wrong merge is worse than a split.
 
 Links are accepted greedily from the closest match. Each track gets at most one
@@ -94,9 +96,14 @@ def _collect(frames: list[dict]) -> tuple[dict[int, _Track], dict[int, dict[int,
     return tracks, feet_by_frame
 
 
-def find_links(frames: list[dict], fps: float, cfg: StitchConfig | None = None) -> list[Link]:
-    """Links between raw track IDs that most likely belong to the same person."""
+def find_links(frames: list[dict], fps: float, cfg: StitchConfig | None = None,
+               teams: dict[int, str | None] | None = None) -> list[Link]:
+    """Links between track IDs that most likely belong to the same person.
+
+    `teams` optionally maps track ID -> team label ("A", "B", "other" or None).
+    """
     cfg = cfg or StitchConfig()
+    teams = teams or {}
     tracks, feet = _collect(frames)
     max_gap = cfg.max_gap_s * fps
     by_start = sorted(tracks.values(), key=lambda t: t.start)
@@ -124,6 +131,9 @@ def find_links(frames: list[dict], fps: float, cfg: StitchConfig | None = None) 
                 continue
             if gap > max_gap:
                 break
+            team_a, team_b = teams.get(a.tid), teams.get(b.tid)
+            if team_a and team_b and team_a != team_b:
+                continue
             b_h = _height(b.boxes[:cfg.edge_frames])
             if max(a_h, b_h) > cfg.max_height_ratio * min(a_h, b_h):
                 continue
@@ -164,13 +174,14 @@ def find_links(frames: list[dict], fps: float, cfg: StitchConfig | None = None) 
     return sorted(links, key=lambda l: (l.from_id, l.to_id))
 
 
-def stitch_tracks(frames: list[dict], fps: float, cfg: StitchConfig | None = None) -> tuple[list[dict], list[Link]]:
+def stitch_tracks(frames: list[dict], fps: float, cfg: StitchConfig | None = None,
+                  teams: dict[int, str | None] | None = None) -> tuple[list[dict], list[Link]]:
     """Return (frames with stitched IDs, links made).
 
-    Each player record keeps the tracker's ID in `raw_track_id`; `track_id` becomes the ID
-    of the first track in its chain.
+    `track_id` becomes the ID of the first track in its chain. Each record keeps the
+    tracker's ID in `raw_track_id` (set here unless an earlier step already set it).
     """
-    links = find_links(frames, fps, cfg)
+    links = find_links(frames, fps, cfg, teams)
     successor = {l.from_id: l.to_id for l in links}
     has_pred = {l.to_id for l in links}
 
@@ -183,8 +194,9 @@ def stitch_tracks(frames: list[dict], fps: float, cfg: StitchConfig | None = Non
             tid = successor.get(tid)
 
     stitched = [
-        {**fr, "players": [{"track_id": final_id[p["track_id"]], "raw_track_id": p["track_id"],
-                            **{k: v for k, v in p.items() if k != "track_id"}}
+        {**fr, "players": [{"track_id": final_id[p["track_id"]],
+                            "raw_track_id": p.get("raw_track_id", p["track_id"]),
+                            **{k: v for k, v in p.items() if k not in ("track_id", "raw_track_id")}}
                            for p in fr["players"]]}
         for fr in frames
     ]

@@ -1,23 +1,26 @@
 """
-Baseline: pose detection + persistent tracking on a match clip.
+Baseline: pose detection + persistent tracking + team classification on a match clip.
 
-Week 1-2 goal (Month 1 of the offside-detection pipeline):
+Offside-detection pipeline, Month 1:
   - Detect every player in a video and estimate their body keypoints.
   - Assign each player a persistent track ID that survives across frames,
     even through occlusion or players crossing paths.
-  - Repair IDs that the online tracker split, with offline tracklet stitching
-    (see track_stitching.py, which must sit next to this script).
-  - Export (a) an annotated video with the final IDs for a visual sanity check,
-    (b) a structured JSON with per-frame keypoints per track ID, which
-    Week 3 (team clustering) and Week 4 (homography) will consume, and
+  - Classify every player's team from the shirt colour, and repair ID swaps between
+    rival players in duels (see team_classification.py).
+  - Repair IDs that the online tracker split, with offline tracklet stitching that never
+    joins players of different teams (see track_stitching.py).
+  - Export (a) an annotated video with final IDs and teams for a visual sanity check,
+    (b) a structured JSON with per-frame keypoints, team and track ID, which the
+    homography and offside stages will consume, and
     (c) a MOTChallenge-format text file, so tracking can be scored against
     SoccerNet ground truth (HOTA / IDF1 / ID switches) with TrackEval.
+
+team_classification.py and track_stitching.py must sit next to this script.
 """
 
 from __future__ import annotations
 
 import argparse
-import colorsys
 import json
 import shutil
 import statistics
@@ -30,15 +33,25 @@ import cv2
 from tqdm import tqdm
 from ultralytics import YOLO
 
+from team_classification import (TeamConfig, TeamModel, grass_hue, repair_team_swaps, torso_lab, track_purity,
+                                 vote_teams)
 from track_stitching import StitchConfig, stitch_tracks
 
 # COCO-17 skeleton (0-based keypoint indices), the same one Ultralytics draws
 SKELETON = [(15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11), (6, 12), (5, 6), (5, 7),
             (6, 8), (7, 9), (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6)]
 
+# Drawing colours (BGR) and labels per team; marker colours, not the kit colours
+TEAM_STYLE = {
+    "A": ((255, 255, 0), "A"),         # cyan
+    "B": ((255, 0, 255), "B"),         # magenta
+    "other": ((0, 255, 255), "otro"),  # yellow: referees, goalkeepers, staff
+    None: ((200, 200, 200), "?"),      # grey: not enough colour evidence
+}
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pose + tracking baseline for match clips")
+    parser = argparse.ArgumentParser(description="Pose + tracking + team baseline for match clips")
     parser.add_argument("--source", required=True, help="Path to the input video (.mp4/.mkv)")
     parser.add_argument("--model", default="yolo26n-pose.pt", help="Ultralytics pose checkpoint")
     parser.add_argument(
@@ -68,6 +81,13 @@ def parse_args() -> argparse.Namespace:
         default=3.0,
         help="Join a track that ends with one that starts up to this many seconds later at a "
         "compatible position (offline tracklet stitching). 0 disables it.",
+    )
+    parser.add_argument("--no-teams", action="store_true", help="Disable team classification and swap repair")
+    parser.add_argument(
+        "--team-min-run",
+        type=int,
+        default=5,
+        help="Labelled frames in a row needed for a team change along a track to count as an ID swap.",
     )
     parser.add_argument("--device", default=None, help="Inference device, e.g. 0 or cpu (default: auto)")
     parser.add_argument("--half", action="store_true", help="FP16 inference (roughly 2x faster on CUDA GPUs)")
@@ -100,14 +120,24 @@ def keypoints_for(result, n: int, thresh: float) -> tuple[list, list]:
     return out_xy, out_conf
 
 
-def id_color(track_id: int) -> tuple[int, int, int]:
-    """A distinct, stable BGR colour per ID (golden-ratio hue spacing)."""
-    r, g, b = colorsys.hsv_to_rgb((track_id * 0.618033988749895) % 1.0, 0.85, 1.0)
-    return int(b * 255), int(g * 255), int(r * 255)
+def draw_legend(img, team_model: TeamModel | None) -> None:
+    """Top-left legend: marker colour, learnt kit colour (teams only) and label."""
+    rows = [("A", "Equipo A"), ("B", "Equipo B"), ("other", "No encaja"), (None, "Sin clasificar")]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    x2, y2 = 230, 16 + 26 * len(rows)
+    img[8:y2, 8:x2] = (img[8:y2, 8:x2] * 0.45 + 30 * 0.55).astype(img.dtype)   # translucent background
+    for i, (team, text) in enumerate(rows):
+        y = 16 + 26 * i
+        cv2.rectangle(img, (16, y), (34, y + 18), TEAM_STYLE[team][0], -1)
+        if team_model is not None and team in ("A", "B"):
+            cv2.rectangle(img, (40, y), (58, y + 18), team_model.bgr(team), -1)
+            cv2.rectangle(img, (40, y), (58, y + 18), (255, 255, 255), 1)
+        cv2.putText(img, text, (66, y + 14), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def render_video(source_path: Path, frames: list[dict], out_path: Path, fps: float, size: tuple[int, int]) -> None:
-    """Draw boxes, skeletons and the final (stitched) IDs on top of the source video."""
+def render_video(source_path: Path, frames: list[dict], out_path: Path, fps: float, size: tuple[int, int],
+                 team_model: TeamModel | None, show_teams: bool) -> None:
+    """Draw boxes, skeletons, final IDs and teams on top of the source video."""
     cap = cv2.VideoCapture(str(source_path))
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
     if not cap.isOpened() or not writer.isOpened():
@@ -122,7 +152,7 @@ def render_video(source_path: Path, frames: list[dict], out_path: Path, fps: flo
             if not ok:
                 break
             for p in fr["players"]:
-                color = id_color(p["track_id"])
+                color, team_text = TEAM_STYLE[p.get("team")]
                 x1, y1, x2, y2 = (int(round(v)) for v in p["bbox_xyxy"])
                 cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
@@ -136,11 +166,13 @@ def render_video(source_path: Path, frames: list[dict], out_path: Path, fps: flo
                     if pt:
                         cv2.circle(img, (int(pt[0]), int(pt[1])), 3, color, -1, cv2.LINE_AA)
 
-                label = f"ID {p['track_id']}"
+                label = f"ID {p['track_id']} {team_text}" if show_teams else f"ID {p['track_id']}"
                 (tw, th), _ = cv2.getTextSize(label, font, 0.6, 2)
                 top = max(y1 - th - 8, 0)
                 cv2.rectangle(img, (x1, top), (x1 + tw + 6, top + th + 8), color, -1)
                 cv2.putText(img, label, (x1 + 3, top + th + 3), font, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            if show_teams:
+                draw_legend(img, team_model)
             writer.write(img)
     finally:
         cap.release()
@@ -184,10 +216,12 @@ def main() -> None:
     total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
     probe.release()
 
+    use_teams = not args.no_teams
+    team_cfg = TeamConfig(min_run=args.team_min_run)
     model = YOLO(args.model)
     precision = {"quantize": 16} if args.half else {}   # FP16; replaces the deprecated `half` argument
 
-    # --- 1. Detection + online tracking ---
+    # --- 1. Detection + online tracking (+ shirt colour of every detection) ---
     frames_out: list[dict] = []
     for frame_idx, result in enumerate(tqdm(
         model.track(
@@ -213,32 +247,72 @@ def main() -> None:
             boxes_xyxy = boxes.xyxy.cpu().tolist()
             confs = boxes.conf.cpu().tolist()
             kpts_xy, kpts_conf = keypoints_for(result, len(track_ids), args.kpt_thresh)
+            grass_h = grass_hue(result.orig_img) if use_teams else None
 
-            for track_id, box, conf, xy, kc in zip(track_ids, boxes_xyxy, confs, kpts_xy, kpts_conf):
+            for i, (track_id, box, conf, xy, kc) in enumerate(zip(track_ids, boxes_xyxy, confs, kpts_xy, kpts_conf)):
+                others = boxes_xyxy[:i] + boxes_xyxy[i + 1:]
                 frame_record["players"].append({
                     "track_id": track_id,
+                    "raw_track_id": track_id,
                     "conf": round(conf, 3),
                     "bbox_xyxy": [round(v, 1) for v in box],
                     "keypoints_xy": xy,
                     "keypoints_conf": kc,
+                    "torso_lab": torso_lab(result.orig_img, box, xy, others, grass_h, team_cfg) if use_teams else None,
                 })
 
         frames_out.append(frame_record)
     n_frames = len(frames_out)
-
-    # --- 2. Offline tracklet stitching ---
     raw_ids = {p["track_id"] for fr in frames_out for p in fr["players"]}
-    stitch_cfg = StitchConfig(max_gap_s=args.stitch_max_gap)
-    if args.stitch_max_gap > 0:
-        frames_out, links = stitch_tracks(frames_out, fps, stitch_cfg)
-    else:
-        links = []
-        for fr in frames_out:
-            for p in fr["players"]:
-                p["raw_track_id"] = p["track_id"]
 
-    # --- 3. Outputs ---
-    render_video(source_path, frames_out, raw_video_path, fps, (width, height))
+    # --- 2. Teams: learn the two kits, label every detection, repair swaps between rivals ---
+    team_model, swaps, splits, team_skip_reason = None, [], [], None
+    if use_teams:
+        team_model = TeamModel.fit([p["torso_lab"] for fr in frames_out for p in fr["players"] if p["torso_lab"]],
+                                   team_cfg)
+        if team_model is None:
+            team_skip_reason = "not enough measurable shirts to learn the two kits"
+        elif not team_model.separated:
+            kits = team_model.to_dict()
+            team_skip_reason = (f"the two shirt colours learnt are not clearly separated "
+                                f"(A = Lab{tuple(kits['A']['lab'])}, B = Lab{tuple(kits['B']['lab'])}, "
+                                f"valley ratio {kits['valley_ratio']:.2f} >= {team_cfg.max_valley_ratio}), "
+                                f"so team labels would be unreliable")
+            team_model = None
+    purity = None
+    for fr in frames_out:
+        for p in fr["players"]:
+            p["team_frame"] = team_model.classify(p["torso_lab"]) if team_model else None
+    if team_model:
+        purity = track_purity(frames_out, team_cfg.min_votes)
+        if purity < team_cfg.min_track_purity:
+            team_skip_reason = (f"the colour groups don't follow the players (only {purity:.0%} of each track's "
+                                f"labels agree with its own team, below {team_cfg.min_track_purity:.0%}), "
+                                f"so they are probably lighting changes rather than kits")
+            team_model = None
+            for fr in frames_out:
+                for p in fr["players"]:
+                    p["team_frame"] = None
+    if team_model:
+        frames_out, swaps, splits = repair_team_swaps(frames_out, fps, team_cfg)
+    for fr in frames_out:
+        for p in fr["players"]:
+            p["segment_id"] = p["track_id"]
+    segment_ids = {p["track_id"] for fr in frames_out for p in fr["players"]}
+    segment_teams = vote_teams(frames_out, team_cfg.min_votes) if team_model else None
+
+    # --- 3. Offline tracklet stitching (never across teams) ---
+    stitch_cfg = StitchConfig(max_gap_s=args.stitch_max_gap)
+    links = []
+    if args.stitch_max_gap > 0:
+        frames_out, links = stitch_tracks(frames_out, fps, stitch_cfg, segment_teams)
+    final_teams = vote_teams(frames_out, team_cfg.min_votes) if team_model else {}
+    for fr in frames_out:
+        for p in fr["players"]:
+            p["team"] = final_teams.get(p["track_id"])
+
+    # --- 4. Outputs ---
+    render_video(source_path, frames_out, raw_video_path, fps, (width, height), team_model, team_model is not None)
     to_h264(raw_video_path, annotated_video_path)
 
     with open(keypoints_json_path, "w") as f:
@@ -252,6 +326,16 @@ def main() -> None:
             "imgsz": args.imgsz,
             "conf": args.conf,
             "keypoint_visibility_threshold": args.kpt_thresh,
+            "teams": {
+                "enabled": team_model is not None,
+                "skipped_reason": team_skip_reason,
+                "track_purity": None if purity is None else round(purity, 3),
+                "config": asdict(team_cfg),
+                "model": team_model.to_dict() if team_model else None,
+                "swaps": swaps,
+                "splits": splits,
+                "track_teams": {str(k): v for k, v in sorted(final_teams.items())},
+            },
             "stitching": {
                 "enabled": args.stitch_max_gap > 0,
                 "config": asdict(stitch_cfg),
@@ -275,15 +359,49 @@ def main() -> None:
     detection_rate = frames_with_detections / n_frames if n_frames else 0.0
     avg_players = sum(len(fr["players"]) for fr in frames_out) / n_frames if n_frames else 0.0
     short_tracks = sum(1 for n in track_lengths.values() if n < fps)
+    segment_start = {}
+    for fr in frames_out:
+        for p in fr["players"]:
+            segment_start.setdefault(p["segment_id"], fr["frame"])
 
     print(f"\nProcessed {n_frames} frames ({width}x{height} @ {fps:.1f}fps, imgsz={args.imgsz}).")
     print(f"Frames with >=1 player detected: {frames_with_detections}/{n_frames} ({detection_rate:.1%})")
     print(f"Tracked players per frame (mean): {avg_players:.1f}")
+
+    if team_model:
+        labels = Counter(p["team_frame"] for fr in frames_out for p in fr["players"])
+        total = sum(labels.values()) or 1
+        kits = team_model.to_dict()
+        print(f"\nTeams learnt from the clip: A = Lab{tuple(kits['A']['lab'])}, B = Lab{tuple(kits['B']['lab'])} "
+              f"(valley ratio {kits['valley_ratio']:.2f}, lower = better separated; "
+              f"track purity {purity:.0%}, higher = labels follow the players)")
+        print("Detections per frame label: " + ", ".join(
+            f"{name} {labels.get(key, 0) / total:.0%}"
+            for key, name in [("A", "A"), ("B", "B"), ("other", "other"), (None, "unclassified")]))
+        if min(team_model.sizes) < 0.15 * sum(team_model.sizes):
+            print("WARNING: one team colour has very few detections; check the legend colours in the video.")
+        print(f"Team swaps repaired: {len(swaps)}")
+        for s in swaps:
+            print(f"  t={s['frame'] / fps:5.1f}s  IDs {s['track_ids'][0]} <-> {s['track_ids'][1]}  "
+                  f"({' / '.join(s['teams'])}, {s['distance']:.2f} body heights apart)")
+        print(f"Team changes without a partner (track split): {len(splits)}")
+        for s in splits:
+            print(f"  t={s['frame'] / fps:5.1f}s  ID {s['track_id']} split -> new ID {s['new_track_id']} ({s['teams']})")
+        team_counts = Counter(final_teams.values())
+        print(f"Final tracks per team: A {team_counts.get('A', 0)}, B {team_counts.get('B', 0)}, "
+              f"other {team_counts.get('other', 0)}, unclassified {team_counts.get(None, 0)}")
+    elif use_teams:
+        print(f"\nTeams: {team_skip_reason}; team steps skipped.")
+
     if args.stitch_max_gap > 0:
-        print(f"Unique track IDs: {len(raw_ids)} from the tracker -> {len(track_lengths)} after stitching "
-              f"({len(links)} links, max gap {args.stitch_max_gap:g} s)")
-    else:
-        print(f"Unique track IDs: {len(track_lengths)} (stitching disabled)")
+        print(f"\nStitching links: {len(links)}")
+        for link in sorted(links, key=lambda l: segment_start.get(l.to_id, 0)):
+            final = next(p["track_id"] for fr in frames_out for p in fr["players"] if p["segment_id"] == link.to_id)
+            print(f"  t={segment_start.get(link.to_id, 0) / fps:5.1f}s  segment {link.to_id} -> ID {final}  "
+                  f"(gap {link.gap_frames} frames, {link.distance:.2f} body heights)")
+
+    print(f"\nUnique track IDs: {len(raw_ids)} from the tracker -> {len(segment_ids)} after team repair "
+          f"-> {len(track_lengths)} final")
     if track_lengths:
         print(
             f"Median track length: {statistics.median(track_lengths.values()):.0f} frames; "
